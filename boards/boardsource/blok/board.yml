@@ -1,5 +1,6 @@
 board:
   name: boardsource_blok
+  full_name: boardsource_blok
   vendor: boardsource
   socs:
     - name: rp2040
