@@ -105,11 +105,6 @@ struct cdc_acm_uart_data {
 	 * roughly emulating flow control.
 	 */
 	bool flow_ctrl;
-	/* Used to enqueue a ZLP transfer when the previous IN transfer length
-	 * was a multiple of the endpoint MPS and no more data is added to
-	 * the TX FIFO during the user callback execution.
-	 */
-	bool zlp_needed;
 	/* UART API IRQ callback */
 	uart_irq_callback_user_data_t cb;
 	/* UART API user callback data */
@@ -330,7 +325,6 @@ static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 			/* Queue pending TX data on IN endpoint */
 			cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
 		}
-
 	}
 
 	if (bi->ep == cdc_acm_get_int_in(c_data)) {
@@ -393,6 +387,16 @@ static void usbd_cdc_acm_suspended(struct usbd_class_data *const c_data)
 
 	/* FIXME: filter stray suspended events earlier */
 	atomic_set_bit(&data->state, CDC_ACM_CLASS_SUSPENDED);
+
+	/* If a transfer is in flight or data is waiting in the TX FIFO, it
+	 * cannot be sent while the bus is suspended. Ask the host to resume
+	 * the bus so it can complete; the request is a no-op unless the host
+	 * has enabled remote wakeup for this device.
+	 */
+	if (atomic_test_bit(&data->state, CDC_ACM_TX_FIFO_BUSY) ||
+	    !ring_buf_is_empty(data->tx_fifo.rb) || data->tx_fifo.altered) {
+		usbd_wakeup_request(c_data->uds_ctx);
+	}
 }
 
 static void usbd_cdc_acm_resumed(struct usbd_class_data *const c_data)
@@ -401,6 +405,27 @@ static void usbd_cdc_acm_resumed(struct usbd_class_data *const c_data)
 	struct cdc_acm_uart_data *data = dev->data;
 
 	atomic_clear_bit(&data->state, CDC_ACM_CLASS_SUSPENDED);
+
+	/* Re-trigger TX that was blocked while the bus was suspended.
+	 * cdc_acm_tx_fifo_handler() bails out early while the class is
+	 * suspended and does not reschedule itself, so data that was
+	 * pending at suspend time would otherwise sit in the TX FIFO until
+	 * unrelated TX activity occurs.
+	 */
+	if (!atomic_test_bit(&data->state, CDC_ACM_TX_FIFO_BUSY) &&
+	    (!ring_buf_is_empty(data->tx_fifo.rb) || data->tx_fifo.altered)) {
+		cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
+	}
+
+	/* Re-arm the bulk-OUT RX endpoint. cdc_acm_rx_fifo_handler() bails
+	 * out (without rescheduling) while the class is suspended, so a
+	 * re-arm that was pending at suspend time would otherwise never be
+	 * retried and the endpoint would silently stop receiving.
+	 */
+	if (atomic_test_bit(&data->state, CDC_ACM_IRQ_RX_ENABLED) &&
+	    !atomic_test_bit(&data->state, CDC_ACM_RX_FIFO_BUSY)) {
+		cdc_acm_work_submit(&data->rx_fifo_work);
+	}
 }
 
 static void *usbd_cdc_acm_get_desc(struct usbd_class_data *const c_data,
@@ -647,7 +672,13 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 	}
 
 	if (atomic_test_bit(&data->state, CDC_ACM_CLASS_SUSPENDED)) {
-		LOG_INF("USB support is suspended (FIXME: submit rwup)");
+		/* Data is waiting but the bus is suspended, so the transfer
+		 * cannot complete. Ask the host to resume the bus; the
+		 * request is a no-op unless the host has enabled remote
+		 * wakeup for this device.
+		 */
+		LOG_DBG("USB is suspended, requesting remote wakeup");
+		usbd_wakeup_request(c_data->uds_ctx);
 		return;
 	}
 
@@ -666,7 +697,16 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 	len = ring_buf_get(data->tx_fifo.rb, buf->data, buf->size);
 	net_buf_add(buf, len);
 
-	data->zlp_needed = len != 0 && len % cdc_acm_get_bulk_mps(c_data) == 0;
+	if (len != 0 && len % cdc_acm_get_bulk_mps(c_data) == 0 &&
+	    ring_buf_is_empty(data->tx_fifo.rb)) {
+		/* The transfer ends exactly on a max-packet boundary and no
+		 * more data is pending. Mark the buffer so the UDC terminates
+		 * it with a zero-length packet; without that the host cannot
+		 * tell the transfer is complete and holds the data until the
+		 * next transfer.
+		 */
+		udc_ep_buf_set_zlp(buf);
+	}
 
 	ret = usbd_ep_enqueue(c_data, buf);
 	if (ret) {
@@ -682,7 +722,7 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
  *  - (x) RX transfer completion
  *  - (x) the end of cdc_acm_irq_cb_handler
  *  - (x) USBD class API enable call
- *  - ( ) USBD class API resumed call (TODO)
+ *  - (x) USBD class API resumed call
  */
 static void cdc_acm_rx_fifo_handler(struct k_work *work)
 {
@@ -714,6 +754,15 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 
 	buf = cdc_acm_buf_alloc(c_data, cdc_acm_get_bulk_out(c_data));
 	if (buf == NULL) {
+		/*
+		 * Clear the BUSY flag (set by the test_and_set above) so the
+		 * next trigger (resume, drain, enable) can retry the re-arm.
+		 * Without this, a single allocation failure leaves the flag
+		 * set forever and the endpoint silently stops receiving.
+		 */
+		LOG_ERR("Failed to allocate net_buf for 0x%02x",
+			cdc_acm_get_bulk_out(c_data));
+		atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
 		return;
 	}
 
@@ -725,6 +774,7 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 		LOG_ERR("Failed to enqueue net_buf for 0x%02x",
 			cdc_acm_get_bulk_out(c_data));
 		net_buf_unref(buf);
+		atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
 	}
 }
 
@@ -791,6 +841,14 @@ static int cdc_acm_fifo_fill(const struct device *dev,
 	k_spin_unlock(&data->lock, key);
 	if (done) {
 		data->tx_fifo.altered = true;
+
+		/* Kick the TX work so the data actually reaches the wire.
+		 * fifo_fill() is the interrupt-driven write path; unlike
+		 * poll_out() it did not schedule tx_fifo_work, so data
+		 * written here would sit in the ring until unrelated TX
+		 * activity (e.g. a bus resume) re-scheduled the work.
+		 */
+		cdc_acm_work_schedule(&data->tx_fifo_work, K_MSEC(1));
 	}
 
 	LOG_INF("UART dev %p, len %d, remaining space %u",
@@ -944,9 +1002,6 @@ static void cdc_acm_irq_cb_handler(struct k_work *work)
 	if (!atomic_test_bit(&data->state, CDC_ACM_TX_FIFO_BUSY)) {
 		if (data->tx_fifo.altered) {
 			LOG_DBG("tx fifo altered, submit work");
-			cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
-		} else if (data->zlp_needed) {
-			LOG_DBG("zlp needed, submit work");
 			cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
 		}
 	}

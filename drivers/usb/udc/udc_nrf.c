@@ -1461,9 +1461,17 @@ static void udc_nrf_thread_handler(const struct device *dev)
 			eps &= ~BIT(bitpos);
 
 			if (USB_EP_DIR_IS_IN(ep)) {
+				/* DIAG: skip 0x85 (the console CDC-ACM) to avoid a log feedback loop. */
+				if (ep != USB_CONTROL_EP_IN && ep != 0x85) {
+					LOG_INF("TX complete ep 0x%02x", ep);
+				}
 				udc_event_xfer_in(dev, ep);
 				udc_event_xfer_in_next(dev, ep);
 			} else {
+				/* DIAG: OUT completion = a host->device transfer landed (RX alive). */
+				if (ep != USB_CONTROL_EP_OUT) {
+					LOG_INF("RX complete ep 0x%02x", ep);
+				}
 				udc_event_xfer_out(dev, ep);
 				udc_event_xfer_out_next(dev, ep);
 			}
@@ -1554,6 +1562,16 @@ static int udc_nrf_ep_enqueue(const struct device *dev,
 			      struct udc_ep_config *cfg,
 			      struct net_buf *buf)
 {
+	/* DIAG: skip 0x85 (the console CDC-ACM) to avoid a log feedback loop. */
+	if (USB_EP_DIR_IS_IN(cfg->addr) && cfg->addr != USB_CONTROL_EP_IN && cfg->addr != 0x85) {
+		LOG_INF("TX enqueue ep 0x%02x len %u", cfg->addr, buf->len);
+	}
+	/* DIAG: OUT enqueue = RX re-arm heartbeat (0x01 RPC, 0x02 console).
+	 * When this stops for 0x01, the device's RX is dead. */
+	if (USB_EP_DIR_IS_OUT(cfg->addr) && cfg->addr != USB_CONTROL_EP_OUT) {
+		LOG_INF("RX enqueue ep 0x%02x", cfg->addr);
+	}
+
 	udc_buf_put(cfg, buf);
 
 	atomic_set_bit(&xfer_new, ep2bit(cfg->addr));
