@@ -512,14 +512,30 @@ static bool base_subgroup_meta_cb(const struct bt_bap_base_subgroup *subgroup, v
 	uint8_t *meta;
 	int ret;
 
+	if (mod_src_param.num_subgroups == ARRAY_SIZE(mod_src_param.subgroups)) {
+		return false;
+	}
+
+	subgroup_param = &mod_src_param.subgroups[mod_src_param.num_subgroups];
+
 	ret = bt_bap_base_get_subgroup_codec_meta(subgroup, &meta);
 	if (ret < 0) {
 		return false;
 	}
 
-	subgroup_param = &mod_src_param.subgroups[mod_src_param.num_subgroups++];
-	subgroup_param->metadata_len = (uint8_t)ret;
-	memcpy(subgroup_param->metadata, meta, subgroup_param->metadata_len);
+	if (ret <= sizeof(subgroup_param->metadata)) {
+		subgroup_param->metadata_len = (uint8_t)ret;
+		(void)memcpy(subgroup_param->metadata, meta, subgroup_param->metadata_len);
+	} else {
+		/* If we cannot store the metadata, we just omit it.
+		 * BASS section 3.2.1.10 Metadata_Length field states
+		 * "the server may write the length of any Metadata
+		 *  parameters for each subgroup to the Metadata_Length field"
+		 */
+		subgroup_param->metadata_len = 0U;
+	}
+
+	mod_src_param.num_subgroups++;
 
 	return true;
 }
@@ -552,9 +568,11 @@ static void update_recv_state_base(const struct bt_bap_broadcast_sink *sink,
 
 	(void)memset(&mod_src_param, 0, sizeof(mod_src_param));
 
+	/* Will set the mod_src_param.num_subgroups and subgroup-related parameters */
 	err = update_recv_state_base_copy_meta(base);
 	if (err != 0) {
-		LOG_WRN("Failed to modify Receive State for sink %p: %d", sink, err);
+		LOG_WRN("Failed to parse all subgroups from BASE for sink %p: %d (%u != %d)", sink,
+			err, mod_src_param.num_subgroups, bt_bap_base_get_subgroup_count(base));
 		return;
 	}
 
@@ -562,7 +580,7 @@ static void update_recv_state_base(const struct bt_bap_broadcast_sink *sink,
 	mod_src_param.src_id = recv_state->src_id;
 	mod_src_param.encrypt_state = recv_state->encrypt_state;
 	mod_src_param.broadcast_id = recv_state->broadcast_id;
-	mod_src_param.num_subgroups = sink->subgroup_count;
+
 	for (uint8_t i = 0U; i < sink->subgroup_count; i++) {
 		struct bt_bap_bass_subgroup *subgroup_param = &mod_src_param.subgroups[i];
 
@@ -623,8 +641,6 @@ static bool base_decode_subgroup_cb(const struct bt_bap_base_subgroup *subgroup,
 	int ret;
 
 	if (sink->subgroup_count == ARRAY_SIZE(sink->subgroups)) {
-		/* We've parsed as many subgroups as we support */
-		LOG_DBG("Could only store %u subgroups", sink->subgroup_count);
 		return false;
 	}
 
@@ -690,21 +706,28 @@ static bool pa_decode_base(struct bt_data *data, void *user_data)
 			if (ret < 0) {
 				LOG_DBG("Invalid BASE: %d", ret);
 				return false;
-			} else if (ret != sink->biginfo_num_bis) {
+			} else if (ret != sink->biginfo.num_bis) {
 				LOG_DBG("BASE contains different amount of BIS (%u) than reported "
 					"by BIGInfo (%u)",
-					ret, sink->biginfo_num_bis);
+					ret, sink->biginfo.num_bis);
 				return false;
 			}
 		}
 
 		/* Store newest BASE info until we are BIG synced */
 		if (sink->big == NULL) {
-			sink->qos_cfg.pd = bt_bap_base_get_pres_delay(base);
+			int err;
 
 			sink->subgroup_count = 0;
 			sink->valid_indexes_bitfield = 0;
-			bt_bap_base_foreach_subgroup(base, base_decode_subgroup_cb, sink);
+
+			err = bt_bap_base_foreach_subgroup(base, base_decode_subgroup_cb, sink);
+			if (err != 0) {
+				LOG_WRN("Failed to parse all subgroups for sink %p: %d (%u != %d)",
+					sink, err, sink->subgroup_count,
+					bt_bap_base_get_subgroup_count(base));
+				return false;
+			}
 
 			LOG_DBG("Updating BASE for sink %p with %d subgroups\n", sink,
 				sink->subgroup_count);
@@ -713,6 +736,7 @@ static bool pa_decode_base(struct bt_data *data, void *user_data)
 			sink->base_size = base_size;
 		}
 
+		/* Metadata may change after syncing, so parse that regardless of `sink->big` */
 		if (atomic_test_bit(sink->flags, BT_BAP_BROADCAST_SINK_FLAG_SRC_ID_VALID)) {
 			update_recv_state_base(sink, base);
 		}
@@ -829,10 +853,7 @@ static void biginfo_recv(struct bt_le_per_adv_sync *sync,
 		return;
 	}
 
-	atomic_set_bit(sink->flags,
-		       BT_BAP_BROADCAST_SINK_FLAG_BIGINFO_RECEIVED);
-	sink->iso_interval = biginfo->iso_interval;
-	sink->biginfo_num_bis = biginfo->num_bis;
+	atomic_set_bit(sink->flags, BT_BAP_BROADCAST_SINK_FLAG_BIGINFO_RECEIVED);
 	if (biginfo->encryption != atomic_test_bit(sink->flags,
 						   BT_BAP_BROADCAST_SINK_FLAG_BIG_ENCRYPTED)) {
 		atomic_set_bit_to(sink->flags,
@@ -845,10 +866,7 @@ static void biginfo_recv(struct bt_le_per_adv_sync *sync,
 		}
 	}
 
-	sink->qos_cfg.framing = biginfo->framing;
-	sink->qos_cfg.phy = biginfo->phy;
-	sink->qos_cfg.sdu = biginfo->max_sdu;
-	sink->qos_cfg.interval = biginfo->sdu_interval;
+	(void)memcpy(&sink->biginfo, biginfo, sizeof(sink->biginfo));
 
 	SYS_SLIST_FOR_EACH_CONTAINER(&sink_cbs, listener, _node) {
 		if (listener->syncable != NULL) {
@@ -1007,12 +1025,24 @@ static int bt_bap_broadcast_sink_setup_stream(struct bt_bap_broadcast_sink *sink
 	bt_bap_iso_bind_ep(iso, ep);
 	stream->iso = &iso->chan;
 
-	bt_bap_qos_cfg_to_iso_qos(iso->chan.qos->rx, &sink->qos_cfg);
+	(void)memset(&ep->qos, 0, sizeof(ep->qos));
+	ep->qos.pd = bt_bap_base_get_pres_delay((const struct bt_bap_base *)sink->base);
+	ep->qos.framing = sink->biginfo.framing;
+	ep->qos.phy = sink->biginfo.phy;
+	ep->qos.rtn = 0U; /* unknown for broadcast sinks */
+	ep->qos.sdu = sink->biginfo.max_sdu;
+	ep->qos.interval = sink->biginfo.sdu_interval;
+#if defined(CONFIG_BT_ISO_TEST_PARAMS)
+	ep->qos.max_pdu = sink->biginfo.max_pdu;
+	ep->qos.burst_number = sink->biginfo.burst_number;
+	ep->qos.num_subevents = sink->biginfo.sub_evt_count;
+#endif /* CONFIG_BT_ISO_TEST_PARAMS */
+	bt_bap_qos_cfg_to_iso_qos(iso->chan.qos->rx, &ep->qos);
 
 	bt_bap_iso_unref(iso);
 
 	bt_bap_stream_attach(NULL, stream, ep, codec_cfg);
-	stream->qos = &sink->qos_cfg;
+	stream->qos = &ep->qos;
 	stream->group = sink;
 
 	return 0;
@@ -1370,7 +1400,7 @@ int bt_bap_broadcast_sink_sync(struct bt_bap_broadcast_sink *sink, uint32_t inde
 	param.num_bis = sink->stream_count;
 	param.bis_bitfield = indexes_bitfield;
 	param.mse = 0; /* Let controller decide */
-	param.sync_timeout = interval_to_sync_timeout(sink->iso_interval);
+	param.sync_timeout = interval_to_sync_timeout(sink->biginfo.iso_interval);
 	param.encryption = atomic_test_bit(sink->flags,
 					   BT_BAP_BROADCAST_SINK_FLAG_BIG_ENCRYPTED);
 	if (param.encryption) {

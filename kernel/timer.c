@@ -8,6 +8,7 @@
 
 #include <zephyr/init.h>
 #include <zephyr/internal/syscall_handler.h>
+#include <zephyr/sys/check.h>
 #include <stdbool.h>
 #include <zephyr/spinlock.h>
 #include <ksched.h>
@@ -178,6 +179,62 @@ void k_timer_init(struct k_timer *timer,
 	z_timer_observer_on_init(timer);
 }
 
+static int timer_cleanup(struct k_timer *timer, __maybe_unused bool locked)
+{
+	int ret = 0;
+
+	SYS_PORT_TRACING_OBJ_FUNC_ENTER(k_timer, cleanup, timer);
+
+	k_spinlock_key_t key = k_spin_lock(&lock);
+
+	CHECKIF(locked && (z_waitq_head_locked(&timer->wait_q) != NULL)) {
+		ret = -EAGAIN;
+		goto exit;
+	}
+
+	CHECKIF(!locked && (z_waitq_head(&timer->wait_q) != NULL)) {
+		ret = -EAGAIN;
+		goto exit;
+	}
+
+	/* Need to abort the timer so it will not trigger anymore.
+	 * Cannot call k_timer_stop() here as that will call any
+	 * defined callbacks. If we get to this point, we can
+	 * reasonably assume that no one cares about the timer
+	 * anymore, and we simply remove the timeout in queue.
+	 */
+	z_abort_timeout(&timer->timeout);
+
+	/* If the expiration handler is in flight on another CPU it may still
+	 * be dereferencing the timer, including running the user expiry_fn
+	 * (z_timer_expiration_handler drops timer.c::lock around it). The
+	 * caller is about to free the timer's storage, so wait for the
+	 * handler to fully complete first. Dropping timer.c::lock lets a
+	 * handler blocked on it run to completion; on uniprocessor nothing is
+	 * in flight (holding the lock disables interrupts) so this is a no-op.
+	 */
+	while (z_timeout_is_inflight(&timer->timeout)) {
+		k_spin_unlock(&lock, key);
+		key = k_spin_lock(&lock);
+	}
+
+exit:
+	SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_timer, cleanup, timer, ret);
+
+	k_spin_unlock(&lock, key);
+
+	return ret;
+}
+
+int k_timer_cleanup(struct k_timer *timer)
+{
+	return timer_cleanup(timer, false);
+}
+
+int z_timer_cleanup_sched_locked(struct k_timer *timer)
+{
+	return timer_cleanup(timer, true);
+}
 
 void z_impl_k_timer_start(struct k_timer *timer, k_timeout_t duration,
 			  k_timeout_t period)

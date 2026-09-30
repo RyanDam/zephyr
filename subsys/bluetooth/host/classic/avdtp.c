@@ -1747,8 +1747,6 @@ static int avdtp_send_cmd(struct bt_avdtp *session, struct net_buf *buf, struct 
 
 	avdtp_send_common(session, buf);
 
-	/* Initialize and start timeout timer */
-	k_work_init_delayable(&session->timeout_work, avdtp_timeout);
 	/* Start timeout work */
 	k_work_reschedule(&session->timeout_work, AVDTP_TIMEOUT);
 
@@ -1821,6 +1819,9 @@ void bt_avdtp_l2cap_disconnected(struct bt_l2cap_chan *chan)
 
 	LOG_DBG("chan %p session %p", chan, session);
 	session->br_chan.chan.conn = NULL;
+
+	k_work_cancel_delayable(&session->timeout_work);
+
 	/* Clear the Pending req if set*/
 	if (session->req) {
 		struct bt_avdtp_req *req = session->req;
@@ -2156,6 +2157,16 @@ int bt_avdtp_connect(struct bt_conn *conn, struct bt_avdtp *session)
 		return -ENOMEM;
 	}
 
+	/* The release work submitted when the previous connection was
+	 * disconnected may still be pending. Re-initializing a queued work
+	 * item would corrupt the work queue, so reject the session reuse
+	 * until the release work has completed.
+	 */
+	if (k_work_busy_get(&session->_release_work) != 0) {
+		k_sem_give(&avdtp_sem_lock);
+		return -EBUSY;
+	}
+
 	session->br_chan.chan.conn = conn;
 	bt_avdtp_clear_tx(session);
 	k_sem_give(&avdtp_sem_lock);
@@ -2163,6 +2174,7 @@ int bt_avdtp_connect(struct bt_conn *conn, struct bt_avdtp *session)
 	/* Locking semaphore initialized to 1 (unlocked) */
 	k_sem_init(&session->sem_lock, 1, 1);
 	k_work_init(&session->_release_work, avdtp_release_work);
+	k_work_init_delayable(&session->timeout_work, avdtp_timeout);
 	session->br_chan.rx.mtu = BT_L2CAP_RX_MTU;
 	session->br_chan.chan.ops = &signal_chan_ops;
 	session->br_chan.required_sec_level = BT_SECURITY_L2;
@@ -2219,12 +2231,23 @@ int bt_avdtp_l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
 	k_sem_take(&avdtp_sem_lock, K_FOREVER);
 
 	if (session->br_chan.chan.conn == NULL) {
+		/* The release work submitted when the previous connection
+		 * was disconnected may still be pending. Re-initializing a
+		 * queued work item would corrupt the work queue, so reject
+		 * the session reuse until the release work has completed.
+		 */
+		if (k_work_busy_get(&session->_release_work) != 0) {
+			k_sem_give(&avdtp_sem_lock);
+			return -ENOMEM;
+		}
+
 		session->br_chan.chan.conn = conn;
 		bt_avdtp_clear_tx(session);
 		k_sem_give(&avdtp_sem_lock);
 		/* Locking semaphore initialized to 1 (unlocked) */
 		k_sem_init(&session->sem_lock, 1, 1);
 		k_work_init(&session->_release_work, avdtp_release_work);
+		k_work_init_delayable(&session->timeout_work, avdtp_timeout);
 		session->br_chan.chan.ops = &signal_chan_ops;
 		session->br_chan.rx.mtu = BT_L2CAP_RX_MTU;
 		*chan = &session->br_chan.chan;

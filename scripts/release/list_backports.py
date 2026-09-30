@@ -77,10 +77,26 @@ def parse_args():
                         metavar='PR', type=int, action='append', default=[])
     parser.add_argument("-r", "--repo", default="zephyr",
                         help="Github repository")
+    parser.add_argument('-c', '--check', dest='check', action='store_true',
+                        help='check mode: verify a single PR has an associated issue')
+    parser.add_argument('--comment', dest='comment', action='store_true',
+                        help='in check mode, post a comment on the PR when an issue is '
+                             'missing, and remove any such comment once one is added. '
+                             'Requires a token with write access to pull requests, which '
+                             'CI only has for pull requests from a branch of this '
+                             'repository, not from a fork')
 
     args = parser.parse_args()
 
-    if args.includes:
+    if args.comment and not args.check:
+        logging.error('--comment requires --check')
+        return None
+
+    if args.check:
+        if len(args.includes) != 1:
+            logging.error('--check requires exactly one -p/--include-pull PR number')
+            return None
+    elif args.includes:
         if getattr(args, 'start'):
             logging.error(
                 'the --start argument should not be used with --include-pull')
@@ -224,7 +240,7 @@ class Backport(object):
         for p in self._pulls:
             # check for issues in this pr
             issues_for_this_pr = {}
-            with io.StringIO(p.body) as buf:
+            with io.StringIO(p.body or '') as buf:
                 for line in buf.readlines():
                     line = line.strip()
                     match = re.search(r"^Fixes[:]?\s*#([1-9][0-9]*).*", line)
@@ -283,6 +299,45 @@ class Backport(object):
         return self._pulls_with_invalid_issues
 
 
+BACKPORT_CHECK_MARKER = '<!-- backport-issue-check -->'
+
+MISSING_ISSUE_COMMENT = (
+    BACKPORT_CHECK_MARKER + '\n'
+    'This pull request to a release branch does not have an associated GitHub issue.\n\n'
+    'Please update the pull request description to include a reference to the issue '
+    'being fixed, for example:\n\n'
+    '```\nFixes #<issue_number>\n```\n\n'
+    'For stable releases, all changes MUST have a reference to an issue or a published '
+    'advisory documenting:\n'
+    '- the issue being fixed\n'
+    '- its severity/impact\n'
+    '\nSee https://docs.zephyrproject.org/latest/project/release_process.html#issue-tracking-during-feature-freeze '
+    'for more details.'
+)
+
+
+def clear_bot_comments(pr):
+    """Delete any previous bot comments on pr that contain the marker."""
+    try:
+        for c in pr.get_issue_comments():
+            if BACKPORT_CHECK_MARKER in c.body:
+                try:
+                    c.delete()
+                except Exception as e:
+                    logging.warning(f'failed to delete comment {c.id} on PR #{pr.number}: {e}')
+    except Exception as e:
+        logging.warning(f'failed to list comments on PR #{pr.number}: {e}')
+
+
+def post_missing_issue_comment(pr):
+    """Replace any previous bot comment on pr with a fresh one."""
+    clear_bot_comments(pr)
+    try:
+        pr.create_issue_comment(MISSING_ISSUE_COMMENT)
+    except Exception as e:
+        logging.warning(f'failed to post comment on PR #{pr.number}: {e}')
+
+
 def main():
     args = parse_args()
 
@@ -321,6 +376,9 @@ def main():
 
     pulls_without_issues = bp.get_pulls_without_issues()
     if pulls_without_issues:
+        if args.comment:
+            for p in pulls_without_issues:
+                post_missing_issue_comment(p)
         logging.error(
             'Please ensure the body of each PR to a release branch contains "Fixes #1234"')
         logging.error('The following PRs are lacking associated issues:')
@@ -328,6 +386,13 @@ def main():
             logging.error(
                 f'https://github.com/{repo.organization.login}/{repo.name}/pull/{p.number}')
         return os.EX_DATAERR
+
+    if args.check:
+        if args.comment:
+            # clean up any previous failure comments now that the PR is valid
+            for p in bp.get_pulls():
+                clear_bot_comments(p)
+        return os.EX_OK
 
     if args.json:
         bp.print_json()

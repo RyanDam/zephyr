@@ -287,14 +287,9 @@ static enum net_verdict ethernet_recv(struct net_if *iface,
 				  sizeof(struct net_eth_addr), NET_LINK_ETHERNET);
 
 	if (IS_ENABLED(CONFIG_NET_ETHERNET_BRIDGE) && net_eth_iface_is_bridged(ctx)) {
-		verdict = eth_bridge_input_process(iface, pkt);
+		verdict = eth_bridge_input_process(iface, pkt, &iface);
 		if (verdict == NET_DROP) {
 			goto drop;
-		}
-
-		/* Handled by bridge locally */
-		if (verdict == NET_OK) {
-			iface = net_eth_get_bridge(ctx);
 		}
 	}
 
@@ -306,6 +301,16 @@ static enum net_verdict ethernet_recv(struct net_if *iface,
 			struct net_eth_vlan_hdr *hdr_vlan =
 				(struct net_eth_vlan_hdr *)NET_ETH_HDR(pkt);
 			struct net_if *vlan_iface;
+
+			/* The frame was only checked to hold a non-tagged
+			 * Ethernet header so far. Make sure the larger VLAN
+			 * header is fully present before reading the tag out
+			 * of it and before pulling it below.
+			 */
+			if (pkt->buffer->len < sizeof(struct net_eth_vlan_hdr)) {
+				NET_DBG("Dropping frame, truncated VLAN header");
+				goto drop;
+			}
 
 			net_pkt_set_vlan_tci(pkt, net_ntohs(hdr_vlan->vlan.tci));
 			type = net_ntohs(hdr_vlan->type);
@@ -584,7 +589,7 @@ static struct net_buf *ethernet_fill_header(struct ethernet_context *ctx,
 	}
 
 	reserve_ll_header = get_reserve_ll_header_size(orig_iface);
-	if (reserve_ll_header > 0) {
+	if ((reserve_ll_header > 0) && (reserve_ll_header <= net_buf_headroom(pkt->buffer))) {
 		hdr_len = reserve_ll_header;
 		hdr_frag = pkt->buffer;
 
@@ -593,6 +598,12 @@ static struct net_buf *ethernet_fill_header(struct ethernet_context *ctx,
 		/* Make room for the header */
 		net_buf_push(pkt->buffer, hdr_len);
 	} else {
+		/*
+		 * Packets can be allocated by a different L2 and forwarded to
+		 * Ethernet. Such packets do not have the Ethernet header space
+		 * reserved by ethernet_l2_alloc(), so use a separate fragment.
+		 */
+		reserve_ll_header = 0U;
 		hdr_len = IS_ENABLED(CONFIG_NET_VLAN) ?
 			sizeof(struct net_eth_vlan_hdr) :
 			sizeof(struct net_eth_hdr);

@@ -679,12 +679,22 @@ void z_sched_wake_thread_locked(struct k_thread *thread)
 /* Timeout handler for *_thread_timeout() APIs */
 void z_thread_timeout(struct _timeout *timeout)
 {
+	k_spinlock_key_t key = k_spin_lock(&_sched_spinlock);
+
+	if (z_is_timeout_handler_canceled(timeout)) {
+		/*
+		 * The timeout handler was canceled by a thread on another
+		 * CPU or another ISR. Bail.
+		 */
+		k_spin_unlock(&_sched_spinlock, key);
+		return;
+	}
+
 	struct k_thread *thread = CONTAINER_OF(timeout,
 					       struct k_thread, base.timeout);
 
-	K_SPINLOCK(&_sched_spinlock) {
-		z_sched_wake_thread_locked(thread);
-	}
+	z_sched_wake_thread_locked(thread);
+	k_spin_unlock(&_sched_spinlock, key);
 }
 #endif /* CONFIG_SYS_CLOCK_EXISTS */
 
@@ -727,8 +737,12 @@ struct k_thread *z_unpend1_no_timeout(_wait_q_t *wait_q)
 
 void z_unpend_thread(struct k_thread *thread)
 {
-	z_unpend_thread_no_timeout(thread);
-	z_abort_thread_timeout(thread);
+	K_SPINLOCK(&_sched_spinlock) {
+		if (thread->base.pended_on != NULL) {
+			unpend_thread_no_timeout(thread);
+		}
+		z_abort_thread_timeout(thread);
+	}
 }
 
 /* Priority set utility that does no rescheduling, it just changes the
@@ -993,7 +1007,9 @@ int z_unpend_all_locked(_wait_q_t *wait_q)
 	__ASSERT(z_spin_is_locked(&_sched_spinlock), "sched lock not held");
 #endif
 
-	for (thread = z_waitq_head(wait_q); thread != NULL; thread = z_waitq_head(wait_q)) {
+	for (thread = z_waitq_head_locked(wait_q);
+	     thread != NULL;
+	     thread = z_waitq_head_locked(wait_q)) {
 		unpend_thread_no_timeout(thread);
 		z_abort_thread_timeout(thread);
 		ready_thread(thread);
@@ -1307,7 +1323,9 @@ static inline void unpend_all(_wait_q_t *wait_q)
 {
 	struct k_thread *thread;
 
-	for (thread = z_waitq_head(wait_q); thread != NULL; thread = z_waitq_head(wait_q)) {
+	for (thread = z_waitq_head_locked(wait_q);
+	     thread != NULL;
+	     thread = z_waitq_head_locked(wait_q)) {
 		unpend_thread_no_timeout(thread);
 		z_abort_thread_timeout(thread);
 		arch_thread_return_value_set(thread, 0);
@@ -1513,7 +1531,13 @@ static bool thread_obj_validate(struct k_thread *thread)
 #ifdef CONFIG_LOG
 		k_object_dump_error(ret, thread, ko, K_OBJ_THREAD);
 #endif /* CONFIG_LOG */
-		K_OOPS(K_SYSCALL_VERIFY_MSG(ret, "access denied"));
+		/* ret is a non-zero error code here (the 0 and -EINVAL cases
+		 * are handled above), so this branch must always oops. Passing
+		 * ret as the "verify" expression would treat the failure code as
+		 * success and fall through to CODE_UNREACHABLE; verify ret == 0
+		 * so the oops is actually raised.
+		 */
+		K_OOPS(K_SYSCALL_VERIFY_MSG(ret == 0, "access denied"));
 	}
 	CODE_UNREACHABLE; /* LCOV_EXCL_LINE */
 }

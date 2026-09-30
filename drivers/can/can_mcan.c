@@ -712,7 +712,7 @@ static void can_mcan_get_message(const struct device *dev, uint16_t fifo_offset,
 	const struct can_mcan_config *config = dev->config;
 	const struct can_mcan_callbacks *cbs = config->callbacks;
 	struct can_mcan_rx_fifo_hdr hdr;
-	struct can_frame frame = {0};
+	struct can_frame frame;
 	can_rx_callback_t cb;
 	void *user_data;
 	uint32_t get_idx;
@@ -737,6 +737,8 @@ static void can_mcan_get_message(const struct device *dev, uint16_t fifo_offset,
 			LOG_ERR("failed to read Rx FIFO header (err %d)", err);
 			return;
 		}
+
+		memset(&frame, 0, sizeof(frame));
 
 		frame.dlc = hdr.dlc;
 
@@ -1417,8 +1419,6 @@ int can_mcan_init(const struct device *dev)
 	__ASSERT_NO_MSG(cbs->num_std <= config->mram_elements[CAN_MCAN_MRAM_CFG_STD_FILTER]);
 	__ASSERT_NO_MSG(cbs->num_ext <= config->mram_elements[CAN_MCAN_MRAM_CFG_EXT_FILTER]);
 
-	k_mutex_init(&data->lock);
-	k_mutex_init(&data->tx_mtx);
 	k_sem_init(&data->tx_sem, cbs->num_tx, cbs->num_tx);
 
 	if (config->common.phy != NULL && !device_is_ready(config->common.phy)) {

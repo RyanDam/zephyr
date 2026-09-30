@@ -8,6 +8,7 @@
 #define ZEPHYR_KERNEL_INCLUDE_KSCHED_H_
 
 #include <zephyr/kernel_structs.h>
+#include <kspinlock.h>
 #include <kernel_internal.h>
 #include <timeout_q.h>
 #include <kthread.h>
@@ -38,22 +39,23 @@ BUILD_ASSERT(K_LOWEST_APPLICATION_THREAD_PRIO
 #define Z_ASSERT_VALID_PRIO(prio, entry_point) __ASSERT((prio) == -1, "")
 #endif /* CONFIG_MULTITHREADING */
 
-#if (CONFIG_MP_MAX_NUM_CPUS == 1)
-#define LOCK_SCHED_SPINLOCK
-#else
-#define LOCK_SCHED_SPINLOCK   K_SPINLOCK(&_sched_spinlock)
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-extern struct k_spinlock _sched_spinlock;
-
 extern struct k_thread _thread_dummy;
 
 void z_sched_init(void);
+
+/**
+ * @brief Unpend thread, do not abort its timeout (if it exists).
+ */
 void z_unpend_thread_no_timeout(struct k_thread *thread);
+
+/**
+ * @brief Unpend thread and abort its timeout (if it exists).
+ */
+void z_unpend_thread(struct k_thread *thread);
 struct k_thread *z_unpend1_no_timeout(_wait_q_t *wait_q);
 int z_pend_curr(struct k_spinlock *lock, k_spinlock_key_t key,
 	       _wait_q_t *wait_q, k_timeout_t timeout);
@@ -61,7 +63,6 @@ void z_pend_thread(struct k_thread *thread, _wait_q_t *wait_q,
 		   k_timeout_t timeout);
 void z_reschedule(struct k_spinlock *lock, k_spinlock_key_t key);
 void z_reschedule_irqlock(uint32_t key);
-void z_unpend_thread(struct k_thread *thread);
 int z_unpend_all(_wait_q_t *wait_q);
 int z_unpend_all_locked(_wait_q_t *wait_q);
 bool z_thread_prio_set(struct k_thread *thread, int prio);
