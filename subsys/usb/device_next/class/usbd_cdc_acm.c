@@ -687,6 +687,15 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 		return;
 	}
 
+	if (ring_buf_is_empty(data->tx_fifo.rb)) {
+		/* Nothing to send (the data was consumed by an earlier run).
+		 * Do not enqueue a zero-length transfer; a new write will
+		 * reschedule this work.
+		 */
+		atomic_clear_bit(&data->state, CDC_ACM_TX_FIFO_BUSY);
+		return;
+	}
+
 	buf = cdc_acm_buf_alloc(c_data, cdc_acm_get_bulk_in(c_data));
 	if (buf == NULL) {
 		atomic_clear_bit(&data->state, CDC_ACM_TX_FIFO_BUSY);
@@ -1012,11 +1021,17 @@ static void cdc_acm_irq_cb_handler(struct k_work *work)
 		cdc_acm_work_submit(&data->irq_cb_work);
 	}
 
-	if (atomic_test_bit(&data->state, CDC_ACM_IRQ_TX_ENABLED) &&
-	    ring_buf_space_get(data->tx_fifo.rb)) {
-		LOG_DBG("tx irq pending, submit irq_cb_work");
-		cdc_acm_work_submit(&data->irq_cb_work);
-	}
+	/*
+	 * Do NOT re-submit irq_cb_work here based on TX readiness. The
+	 * condition "TX enabled && ring has space" is a level, not an edge:
+	 * the app enables TX once and leaves it enabled, and the ring is
+	 * almost always non-full when idle, so re-submitting on that condition
+	 * makes irq_cb_handler invoke the app callback in a tight loop forever
+	 * (wasting CPU and starving the shared work queue of tx_fifo_work and
+	 * the console's TX work). TX-ready is already reported to the app on
+	 * the two real edges: uart_irq_tx_enable() and TX transfer completion
+	 * (usbd_cdc_acm_request()).
+	 */
 }
 
 static void cdc_acm_irq_callback_set(const struct device *dev,
